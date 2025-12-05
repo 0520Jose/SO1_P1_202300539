@@ -1,0 +1,14 @@
+version: '3'
+services:
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana_so1
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_INSTALL_PLUGINS=frser-sqlite-datasource
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      # Asegúrate de que ../go-daemon/metrics.db sea un archivo y NO un directorio
+      - ../go-daemon/metrics.db:/var/lib/grafana/metrics.db:ro
+    user: "0:0"   # Puedes quitar esto si los permisos del archivo están correctamente configurados
