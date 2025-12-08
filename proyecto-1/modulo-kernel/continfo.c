@@ -17,12 +17,18 @@ MODULE_DESCRIPTION("Modulo de Contenedores SO1");
 static int show_continfo(struct seq_file *m, void *v) {
     struct task_struct *task;
     struct task_struct *init_task_ptr = &init_task; 
+    struct sysinfo i;
     unsigned long rss;
+    long total_ram;
     bool first = true;
     u64 cpu_time_ns;
     u64 elapsed_time_ns;
     u64 cpu_usage_percent;
     u64 now_ns;
+    u64 mem_usage_percent;
+
+    si_meminfo(&i);
+    total_ram = (i.totalram * 4);
 
     seq_printf(m, "[\n");
 
@@ -57,10 +63,16 @@ static int show_continfo(struct seq_file *m, void *v) {
                 }
             }
 
+            mem_usage_percent = 0;
+            if (total_ram > 0) {
+                mem_usage_percent = ((rss / 1024) * 100) / total_ram;
+            }
+
             seq_printf(m, "  {\n");
             seq_printf(m, "    \"pid\": %d,\n", task->pid);
             seq_printf(m, "    \"name\": \"%s\",\n", task->comm);
             seq_printf(m, "    \"rss\": %lu,\n", rss / 1024); 
+            seq_printf(m, "    \"mem_percent\": %llu,\n", mem_usage_percent);
             seq_printf(m, "    \"vsz\": %lu,\n", (task->mm) ? (task->mm->total_vm << (PAGE_SHIFT - 10)) : 0);
             seq_printf(m, "    \"cpu\": %llu\n", cpu_usage_percent);
             seq_printf(m, "  }");

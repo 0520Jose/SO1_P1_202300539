@@ -24,6 +24,7 @@ static int show_sysinfo(struct seq_file *m, void *v) {
     u64 elapsed_time_ns;
     u64 cpu_usage_percent;
     u64 now_ns;
+    u64 mem_usage_percent;
 
     si_meminfo(&i);
 
@@ -59,11 +60,17 @@ static int show_sysinfo(struct seq_file *m, void *v) {
              }
         }
 
+        mem_usage_percent = 0;
+        if (total_ram > 0) {
+            mem_usage_percent = ((rss / 1024) * 100) / total_ram;
+        }
+
         seq_printf(m, "    {\n");
         seq_printf(m, "      \"pid\": %d,\n", task->pid);
         seq_printf(m, "      \"name\": \"%s\",\n", task->comm);
         seq_printf(m, "      \"state\": %ld,\n", task->__state);
         seq_printf(m, "      \"rss\": %lu,\n", rss / 1024);
+        seq_printf(m, "      \"mem_percent\": %llu,\n", mem_usage_percent);
         seq_printf(m, "      \"vsz\": %lu,\n", (task->mm) ? (task->mm->total_vm << (PAGE_SHIFT - 10)) : 0);
         seq_printf(m, "      \"cpu\": %llu\n", cpu_usage_percent);
         seq_printf(m, "    }");

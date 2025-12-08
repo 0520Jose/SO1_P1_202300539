@@ -15,20 +15,19 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-// Ajusta esta ruta si es necesario. Asumimos que estás en /go-daemon y el script en /bash
 const SCRIPT_PATH = "../bash/generar_contenedores.sh" 
-
 const PROCS_FILE = "/proc/sysinfo_so1_202300539"
 const CONT_FILE = "/proc/continfo_so1_202300539"
 const DB_PATH = "./metrics.db"
 
 type Process struct {
-	Pid   int    `json:"pid"`
-	Name  string `json:"name"`
-	State int    `json:"state"`
-	Rss   int64  `json:"rss"`
-	Vsz   int64  `json:"vsz"`
-	Cpu   int64  `json:"cpu"`
+	Pid        int    `json:"pid"`
+	Name       string `json:"name"`
+	State      int    `json:"state"`
+	Rss        int64  `json:"rss"`
+	Vsz        int64  `json:"vsz"`
+	Cpu        int64  `json:"cpu"`
+	MemPercent int64  `json:"mem_percent"`
 }
 
 type SysInfo struct {
@@ -42,12 +41,18 @@ func main() {
 	initDB()
 	log.Println("Iniciando Daemon SO1...")
 
-	// 1. Cargar modulos
 	exec.Command("sudo", "insmod", "../modulo-kernel/sysinfo.ko").Run()
 	exec.Command("sudo", "insmod", "../modulo-kernel/continfo.ko").Run()
 
-	// 2. Iniciar el "Cronjob" interno en paralelo (Goroutine)
-	// Esto ejecutará el script cada 1 minuto sin detener el resto del programa
+	log.Println("Levantando Grafana...")
+	cmd := exec.Command("docker", "compose", "-f", "../dashboard/docker-compose.yml", "up", "-d")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	err := cmd.Run()
+	if err != nil {
+		log.Printf("Advertencia iniciando Grafana: %v", err)
+	}
+
 	go startGenerationService()
 
 	c := make(chan os.Signal, 1)
@@ -58,29 +63,21 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// 3. Loop de monitoreo (Cada 20 segundos)
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 
 	for range ticker.C {
 		log.Println("--- Ciclo de Monitoreo ---")
-		
 		deleted := manageContainers()
 		readAndSaveMetrics(deleted)
 	}
 }
 
-// --- NUEVA FUNCION PARA EJECUTAR EL SCRIPT ---
 func startGenerationService() {
 	log.Println("Iniciando servicio de generacion de contenedores (cada 60s)")
-
-	// Ejecutar inmediatamente la primera vez
 	runScript()
-
-	// Configurar el ticker para cada 1 minuto
 	tickerGen := time.NewTicker(60 * time.Second)
 	defer tickerGen.Stop()
-
 	for range tickerGen.C {
 		runScript()
 	}
@@ -88,11 +85,7 @@ func startGenerationService() {
 
 func runScript() {
 	log.Println("Ejecutando script de generacion...")
-	
-	// Ejecutamos bash indicando la ruta del script
 	cmd := exec.Command("/bin/bash", SCRIPT_PATH)
-	
-	// Capturamos salida por si hay errores en el script bash
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Printf("Error ejecutando script: %v | Salida: %s", err, string(output))
@@ -100,7 +93,6 @@ func runScript() {
 		log.Println("Contenedores generados exitosamente.")
 	}
 }
-// ---------------------------------------------
 
 func initDB() {
 	db, err := sql.Open("sqlite3", DB_PATH)
@@ -117,6 +109,7 @@ func initDB() {
 		free_ram INTEGER,
 		used_ram INTEGER,
 		container_count INTEGER,
+		process_count INTEGER,
 		deleted_count INTEGER
 	);
 	`
@@ -133,15 +126,26 @@ func initDB() {
 	);
 	`
 	_, err = db.Exec(sqlStmt2)
+
+	sqlStmt3 := `
+	CREATE TABLE IF NOT EXISTS process_stats (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+		pid INTEGER,
+		name TEXT,
+		ram_usage INTEGER,
+		cpu_usage INTEGER
+	);
+	`
+	_, err = db.Exec(sqlStmt3)
 }
 
 func readAndSaveMetrics(deletedCount int) {
 	data, err := ioutil.ReadFile(PROCS_FILE)
 	if err != nil {
-		log.Printf("Error leyendo proc: %v", err)
+		log.Printf("Error leyendo proc sysinfo: %v", err)
 		return
 	}
-
 	var info SysInfo
 	json.Unmarshal(data, &info)
 
@@ -152,15 +156,20 @@ func readAndSaveMetrics(deletedCount int) {
 	db, _ := sql.Open("sqlite3", DB_PATH)
 	defer db.Close()
 
-	stmt, _ := db.Prepare("INSERT INTO metrics(total_ram, free_ram, used_ram, container_count, deleted_count) values(?,?,?,?,?)")
-	stmt.Exec(info.TotalRam, info.FreeRam, info.UsedRam, len(contProcs), deletedCount)
+	stmt, _ := db.Prepare("INSERT INTO metrics(total_ram, free_ram, used_ram, container_count, process_count, deleted_count) values(?,?,?,?,?,?)")
+	stmt.Exec(info.TotalRam, info.FreeRam, info.UsedRam, len(contProcs), len(info.Processes), deletedCount)
 
 	stmt2, _ := db.Prepare("INSERT INTO container_stats(pid, name, ram_usage, cpu_usage) values(?,?,?,?)")
 	for _, p := range contProcs {
 		stmt2.Exec(p.Pid, p.Name, p.Rss/1024, p.Cpu)
 	}
 
-	log.Printf("Datos guardados. Eliminados en esta ronda: %d", deletedCount)
+	stmt3, _ := db.Prepare("INSERT INTO process_stats(pid, name, ram_usage, cpu_usage) values(?,?,?,?)")
+	for _, p := range info.Processes {
+		stmt3.Exec(p.Pid, p.Name, p.Rss/1024, p.Cpu)
+	}
+
+	log.Printf("Datos guardados. Procesos Sistema: %d | Contenedores: %d | Eliminados: %d", len(info.Processes), len(contProcs), deletedCount)
 }
 
 func manageContainers() int {
@@ -188,9 +197,9 @@ func manageContainers() int {
 			continue
 		}
 
-		if strings.Contains(image, "so1_low") {
+		if strings.Contains(image, "alpine") {
 			lowContainers = append(lowContainers, id)
-		} else if strings.Contains(image, "so1_high") {
+		} else if strings.Contains(image, "stress") {
 			highContainers = append(highContainers, id)
 		}
 	}
@@ -218,7 +227,8 @@ func killExcess(containers []string, limit int, label string) int {
 
 func cleanup() {
 	log.Println("Deteniendo Daemon y limpiando...")
+	exec.Command("sh", "-c", "docker rm -f $(docker ps -aq)").Run()
 	exec.Command("sudo", "rmmod", "sysinfo").Run()
 	exec.Command("sudo", "rmmod", "continfo").Run()
-	log.Println("Modulos descargados. Adios.")
+	log.Println("Modulos descargados y contenedores eliminados. Adios.")
 }

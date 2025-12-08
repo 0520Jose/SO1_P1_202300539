@@ -1,3 +1,0 @@
-FROM python:3.9-alpine
-COPY ram_test.py /app/ram_test.py
-CMD ["python", "/app/ram_test.py"]

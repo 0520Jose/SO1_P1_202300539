@@ -1,4 +1,4 @@
-module github.como/0520Jose/SO1_P1_202300539
+module github.com/0520Jose/SO1_P1_202300539
 
 go 1.24.0
 
