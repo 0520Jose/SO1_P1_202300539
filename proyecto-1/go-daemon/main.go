@@ -3,11 +3,14 @@ package main
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io/ioutil"
 	"log"
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -41,8 +44,14 @@ func main() {
 	initDB()
 	log.Println("Iniciando Daemon SO1...")
 
-	exec.Command("sudo", "insmod", "../modulo-kernel/sysinfo.ko").Run()
-	exec.Command("sudo", "insmod", "../modulo-kernel/continfo.ko").Run()
+	// Cargar módulos del kernel
+	log.Println("Cargando módulos del kernel...")
+	loadCmd := exec.Command("bash", "../bash/load_modules.sh")
+	loadCmd.Stdout = os.Stdout
+	loadCmd.Stderr = os.Stderr
+	if err := loadCmd.Run(); err != nil {
+		log.Printf("Advertencia cargando módulos: %v", err)
+	}
 
 	log.Println("Levantando Grafana...")
 	cmd := exec.Command("docker", "compose", "-f", "../dashboard/docker-compose.yml", "up", "-d")
@@ -53,7 +62,11 @@ func main() {
 		log.Printf("Advertencia iniciando Grafana: %v", err)
 	}
 
-	go startGenerationService()
+	// Configurar cronjob en el sistema
+	setupCronjob()
+
+	// Esperar 5 segundos para que el cronjob comience
+	time.Sleep(5 * time.Second)
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
@@ -73,25 +86,23 @@ func main() {
 	}
 }
 
-func startGenerationService() {
-	log.Println("Iniciando servicio de generacion de contenedores (cada 60s)")
-	runScript()
-	tickerGen := time.NewTicker(60 * time.Second)
-	defer tickerGen.Stop()
-	for range tickerGen.C {
-		runScript()
-	}
-}
-
-func runScript() {
-	log.Println("Ejecutando script de generacion...")
-	cmd := exec.Command("/bin/bash", SCRIPT_PATH)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		log.Printf("Error ejecutando script: %v | Salida: %s", err, string(output))
-	} else {
-		log.Println("Contenedores generados exitosamente.")
-	}
+func cleanup() {
+	log.Println("Deteniendo Daemon y limpiando...")
+	
+	// Eliminar cronjob del sistema
+	removeCronjob()
+	
+	// Detener y eliminar contenedores
+	log.Println("Eliminando todos los contenedores...")
+	exec.Command("sh", "-c", "docker stop $(docker ps -aq) 2>/dev/null").Run()
+	exec.Command("sh", "-c", "docker rm $(docker ps -aq) 2>/dev/null").Run()
+	
+	// Descargar módulos del kernel
+	log.Println("Descargando módulos del kernel...")
+	exec.Command("sudo", "rmmod", "continfo").Run()
+	exec.Command("sudo", "rmmod", "sysinfo").Run()
+	
+	log.Println("✅ Limpieza completa. Adiós.")
 }
 
 func initDB() {
@@ -173,6 +184,20 @@ func readAndSaveMetrics(deletedCount int) {
 }
 
 func manageContainers() int {
+	// Leer métricas de contenedores desde /proc
+	contData, err := ioutil.ReadFile(CONT_FILE)
+	if err != nil {
+		log.Printf("Error leyendo continfo: %v", err)
+		return 0
+	}
+	
+	var contProcs []Process
+	if err := json.Unmarshal(contData, &contProcs); err != nil {
+		log.Printf("Error parseando continfo: %v", err)
+		return 0
+	}
+
+	// Obtener lista de contenedores activos de Docker
 	cmd := exec.Command("docker", "ps", "--format", "{{.ID}}|{{.Image}}|{{.Names}}")
 	output, err := cmd.Output()
 	if err != nil {
@@ -181,32 +206,100 @@ func manageContainers() int {
 	}
 
 	lines := strings.Split(string(output), "\n")
-	var lowContainers []string
-	var highContainers []string
+	
+	type ContainerInfo struct {
+		ID       string
+		Image    string
+		Name     string
+		RamUsage int64
+		CpuUsage int64
+	}
+	
+	var lowContainers []ContainerInfo
+	var highContainers []ContainerInfo
 
+	// Mapear contenedores con sus métricas del /proc
 	for _, line := range lines {
-		if line == "" { continue }
+		if line == "" {
+			continue
+		}
 		parts := strings.Split(line, "|")
-		if len(parts) < 3 { continue }
+		if len(parts) < 3 {
+			continue
+		}
 		
 		id := parts[0]
 		image := parts[1]
 		name := parts[2]
 
+		// No tocar Grafana
 		if strings.Contains(name, "grafana") || strings.Contains(image, "grafana") {
 			continue
 		}
 
+		// Buscar métricas correspondientes en /proc
+		var ramUsage, cpuUsage int64
+		for _, proc := range contProcs {
+			// Intentar correlacionar por nombre del proceso
+			if strings.Contains(proc.Name, "stress") || strings.Contains(proc.Name, "sleep") {
+				ramUsage = proc.Rss
+				cpuUsage = proc.Cpu
+				break
+			}
+		}
+
+		container := ContainerInfo{
+			ID:       id,
+			Image:    image,
+			Name:     name,
+			RamUsage: ramUsage,
+			CpuUsage: cpuUsage,
+		}
+
 		if strings.Contains(image, "alpine") {
-			lowContainers = append(lowContainers, id)
+			lowContainers = append(lowContainers, container)
 		} else if strings.Contains(image, "stress") {
-			highContainers = append(highContainers, id)
+			highContainers = append(highContainers, container)
 		}
 	}
 
+	// Ordenar por consumo de RAM (descendente - mayor consumo primero)
+	sort.Slice(lowContainers, func(i, j int) bool {
+		return lowContainers[i].RamUsage > lowContainers[j].RamUsage
+	})
+	sort.Slice(highContainers, func(i, j int) bool {
+		return highContainers[i].RamUsage > highContainers[j].RamUsage
+	})
+
 	totalDeleted := 0
-	totalDeleted += killExcess(lowContainers, 3, "Bajo Consumo")
-	totalDeleted += killExcess(highContainers, 2, "Alto Consumo")
+
+	// Eliminar exceso de contenedores de bajo consumo (mantener solo 3)
+	if len(lowContainers) > 3 {
+		log.Printf("⚠️  Exceso de contenedores bajo consumo: %d (límite: 3)", len(lowContainers))
+		for i := 3; i < len(lowContainers); i++ {
+			log.Printf("🗑️  Eliminando bajo consumo: %s (RAM: %d KB)", 
+				lowContainers[i].Name, lowContainers[i].RamUsage/1024)
+			exec.Command("docker", "stop", lowContainers[i].ID).Run()
+			exec.Command("docker", "rm", lowContainers[i].ID).Run()
+			totalDeleted++
+		}
+	}
+
+	// Eliminar exceso de contenedores de alto consumo (mantener solo 2)
+	if len(highContainers) > 2 {
+		log.Printf("⚠️  Exceso de contenedores alto consumo: %d (límite: 2)", len(highContainers))
+		for i := 2; i < len(highContainers); i++ {
+			log.Printf("🗑️  Eliminando alto consumo: %s (RAM: %d KB, CPU: %d%%)", 
+				highContainers[i].Name, highContainers[i].RamUsage/1024, highContainers[i].CpuUsage)
+			exec.Command("docker", "stop", highContainers[i].ID).Run()
+			exec.Command("docker", "rm", highContainers[i].ID).Run()
+			totalDeleted++
+		}
+	}
+
+	log.Printf("📊 Estado actual: %d bajo consumo | %d alto consumo | %d eliminados", 
+		len(lowContainers), len(highContainers), totalDeleted)
+	
 	return totalDeleted
 }
 
@@ -225,10 +318,56 @@ func killExcess(containers []string, limit int, label string) int {
 	return deleted
 }
 
-func cleanup() {
-	log.Println("Deteniendo Daemon y limpiando...")
-	exec.Command("sh", "-c", "docker rm -f $(docker ps -aq)").Run()
-	exec.Command("sudo", "rmmod", "sysinfo").Run()
-	exec.Command("sudo", "rmmod", "continfo").Run()
-	log.Println("Modulos descargados y contenedores eliminados. Adios.")
+func setupCronjob() {
+	log.Println("Configurando cronjob en el sistema...")
+	
+	// Obtener ruta absoluta del script
+	scriptPath, err := filepath.Abs(SCRIPT_PATH)
+	if err != nil {
+		log.Printf("Error obteniendo ruta del script: %v", err)
+		return
+	}
+
+	// Hacer el script ejecutable
+	exec.Command("chmod", "+x", scriptPath).Run()
+	
+	// Verificar si ya existe el cronjob
+	checkCmd := exec.Command("bash", "-c", "crontab -l 2>/dev/null | grep -F '"+scriptPath+"'")
+	output, _ := checkCmd.Output()
+	
+	if len(output) > 0 {
+		log.Println("Cronjob ya existe, saltando configuración")
+		return
+	}
+	
+	// Crear entrada de cron (cada minuto)
+	logPath := filepath.Join(filepath.Dir(scriptPath), "execution.log")
+	cronEntry := fmt.Sprintf("* * * * * %s >> %s 2>&1", scriptPath, logPath)
+	
+	// Agregar a crontab
+	cmd := exec.Command("bash", "-c", fmt.Sprintf("(crontab -l 2>/dev/null; echo '%s') | crontab -", cronEntry))
+	if err := cmd.Run(); err != nil {
+		log.Printf("Error configurando cronjob: %v", err)
+	} else {
+		log.Println("✅ Cronjob configurado exitosamente")
+		log.Printf("Comando cron: %s", cronEntry)
+	}
+}
+
+func removeCronjob() {
+	log.Println("Eliminando cronjob del sistema...")
+	
+	scriptPath, err := filepath.Abs(SCRIPT_PATH)
+	if err != nil {
+		log.Printf("Error obteniendo ruta del script: %v", err)
+		return
+	}
+	
+	// Eliminar línea del crontab que contenga el script
+	cmd := exec.Command("bash", "-c", fmt.Sprintf("crontab -l 2>/dev/null | grep -v -F '%s' | crontab -", scriptPath))
+	if err := cmd.Run(); err != nil {
+		log.Printf("Advertencia eliminando cronjob: %v", err)
+	} else {
+		log.Println("✅ Cronjob eliminado exitosamente")
+	}
 }
