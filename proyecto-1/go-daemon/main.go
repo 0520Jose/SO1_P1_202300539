@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -17,11 +18,18 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+// Constantes de configuración
 const SCRIPT_PATH = "../bash/generar_contenedores.sh"
 const PROCS_FILE = "/proc/sysinfo_so1_202300539"
 const CONT_FILE = "/proc/continfo_so1_202300539"
 const DB_PATH = "./metrics.db"
 
+// Límites de contenedores
+const MAX_CONTAINERS = 10
+const MIN_CONTAINERS = 5
+
+
+// Estructuras de datos
 type Process struct {
 	Pid        int    `json:"pid"`
 	Name       string `json:"name"`
@@ -39,37 +47,44 @@ type SysInfo struct {
 	Processes []Process `json:"processes"`
 }
 
-func main() {
-	initDB()
-	log.Println("--- Iniciando Daemon SO1 ---")
+type ContainerInfo struct {
+	ID       string
+	Image    string
+	Name     string
+	RamUsage int64
+	CpuUsage int64
+	IsLow    bool
+}
 
-	// Cargar módulos del kernel
-	log.Println("Cargando módulos del kernel...")
+
+// Función principal
+func main() {
+	//  Inicializacion de base de datos
+	initDB()
+	// Inicializacion de modulos del kernel
 	loadCmd := exec.Command("bash", "../bash/load_modules.sh")
 	loadCmd.Stdout = os.Stdout
 	loadCmd.Stderr = os.Stderr
 	if err := loadCmd.Run(); err != nil {
-		log.Printf("Nota: %v (Probablemente los módulos ya estaban cargados)", err)
+		log.Printf("Error: %v", err)
 	}
 
-	log.Println("Levantando Grafana...")
+	// Iniciar Grafana
 	cmd := exec.Command("docker", "compose", "-f", "../dashboard/docker-compose.yml", "up", "-d")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	if err := cmd.Run(); err != nil {
-		log.Printf("Advertencia iniciando Grafana: %v", err)
+		log.Printf("Error Grafana: %v", err)
+	} else {
+		log.Println("Grafana iniciado correctamente")
 	}
-
-	// Configurar cronjob en el sistema
 	setupCronjob()
-
-	// Esperar brevemente
-	time.Sleep(2 * time.Second)
 
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		<-c
+		log.Println("\n\nSaliendo")
 		cleanup()
 		os.Exit(0)
 	}()
@@ -77,118 +92,250 @@ func main() {
 	ticker := time.NewTicker(20 * time.Second)
 	defer ticker.Stop()
 
-	// Ejecución inicial inmediata
-	manageContainers()
+	deleted := manageContainers()
+	readAndSaveMetrics(deleted)
 
+	// Ciclo de monitoreo
 	for range ticker.C {
-		log.Println("\n--- Ciclo de Monitoreo ---")
 		deleted := manageContainers()
 		readAndSaveMetrics(deleted)
 	}
 }
 
+// Función de limpieza al salir
 func cleanup() {
-	log.Println("\nDeteniendo Daemon y limpiando...")
-
-	// Eliminar cronjob del sistema
+	// Eliminar cronjob
 	removeCronjob()
+	time.Sleep(2 * time.Second)
+	checkCmd := exec.Command("bash", "-c", "crontab -l 2>/dev/null | grep generar_contenedores")
+	if output, _ := checkCmd.Output(); len(output) > 0 {
+		exec.Command("bash", "-c", "crontab -r").Run()
+	} else {
+		log.Println("Cronjob eliminado correctamente")
+	}
 
-	// Detener y eliminar contenedores
-	log.Println("Eliminando TODOS los contenedores...")
-	exec.Command("sh", "-c", "docker stop $(docker ps -aq) 2>/dev/null").Run()
-	exec.Command("sh", "-c", "docker rm $(docker ps -aq) 2>/dev/null").Run()
-
-	// Descargar módulos del kernel
-	log.Println("Descargando módulos del kernel...")
+	// Detener y eliminar contenedores Docker
+	cmd := exec.Command("docker", "ps", "-a", "--format", "{{.ID}}|{{.Names}}")
+	output, _ := cmd.Output()
+	lines := strings.Split(string(output), "\n")
+	
+	stoppedCount := 0
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "|")
+		if len(parts) < 2 {
+			continue
+		}
+		id := parts[0]
+		name := parts[1]
+		if strings.Contains(name, "grafana") {
+			continue
+		}
+		
+		exec.Command("docker", "stop", id).Run()
+		exec.Command("docker", "rm", id).Run()
+		stoppedCount++
+	}
 	exec.Command("sudo", "rmmod", "continfo").Run()
 	exec.Command("sudo", "rmmod", "sysinfo").Run()
 
-	log.Println("✅ Limpieza completa. Adiós.")
+	// Detener Grafana
+	exec.Command("docker", "compose", "-f", "../dashboard/docker-compose.yml", "down").Run()
 }
 
+// Funcion de inicialización de la base de datos
 func initDB() {
+	// Crear base de datos SQLite si no existe
 	db, err := sql.Open("sqlite3", DB_PATH)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer db.Close()
 
+	// Crear tablas si no existen
 	sqlStmt := `
 	CREATE TABLE IF NOT EXISTS metrics (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+		timestamp INTEGER NOT NULL,
 		total_ram INTEGER,
 		free_ram INTEGER,
 		used_ram INTEGER,
 		container_count INTEGER,
 		process_count INTEGER,
 		deleted_count INTEGER
-	);
-	`
-	_, err = db.Exec(sqlStmt)
+	);`
+	db.Exec(sqlStmt)
 
+	// Tabla para estadísticas de contenedores
 	sqlStmt2 := `
 	CREATE TABLE IF NOT EXISTS container_stats (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+		timestamp INTEGER NOT NULL,
+		container_id TEXT,
+		container_name TEXT,
 		pid INTEGER,
-		name TEXT,
+		process_name TEXT,
 		ram_usage INTEGER,
 		cpu_usage INTEGER
-	);
-	`
-	_, err = db.Exec(sqlStmt2)
+	);`
+	db.Exec(sqlStmt2)
 
+	// Tabla para estadísticas de procesos
 	sqlStmt3 := `
 	CREATE TABLE IF NOT EXISTS process_stats (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+		timestamp INTEGER NOT NULL,
 		pid INTEGER,
 		name TEXT,
 		ram_usage INTEGER,
 		cpu_usage INTEGER
-	);
-	`
-	_, err = db.Exec(sqlStmt3)
+	);`
+	db.Exec(sqlStmt3)
 }
 
+// Función para leer metricas y guardarlas en la base de datos
 func readAndSaveMetrics(deletedCount int) {
-	// Intentar leer métricas del sistema
+	// Leer sysinfo desde /proc
 	data, err := ioutil.ReadFile(PROCS_FILE)
 	if err != nil {
-		log.Printf("Error leyendo proc sysinfo: %v", err)
+		log.Printf("Error leyendo /proc/sysinfo: %v", err)
 		return
 	}
+
 	var info SysInfo
-	json.Unmarshal(data, &info)
+	if err := json.Unmarshal(data, &info); err != nil {
+		log.Printf("Error parseando sysinfo: %v", err)
+		return
+	}
 
-	// Intentar leer métricas de contenedores
-	contData, _ := ioutil.ReadFile(CONT_FILE)
-	var contProcs []Process
-	json.Unmarshal(contData, &contProcs)
+	cmd := exec.Command("docker", "ps", "--format", "{{.ID}}|{{.Names}}")
+	output, err := cmd.Output()
+	if err != nil {
+		log.Printf("Error obteniendo contenedores Docker: %v", err)
+		return
+	}
 
-	db, _ := sql.Open("sqlite3", DB_PATH)
+	lines := strings.Split(string(output), "\n")
+	type DockerContainer struct {
+		ID   string
+		Name string
+	}
+
+	// Mapa de contenedores Docker
+	dockerContainers := make(map[string]DockerContainer)
+	realContainerCount := 0
+	for _, line := range lines {
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "|")
+		if len(parts) >= 2 {
+			id := parts[0]
+			name := parts[1]
+			if strings.Contains(name, "grafana") || strings.Contains(strings.ToLower(name), "grafana") {
+				continue
+			}
+			dockerContainers[name] = DockerContainer{
+				ID:   id,
+				Name: name,
+			}
+			realContainerCount++
+		}
+	}
+
+	db, err := sql.Open("sqlite3", DB_PATH)
+	if err != nil {
+		log.Printf("Error BD: %v", err)
+		return
+	}
 	defer db.Close()
 
-	stmt, _ := db.Prepare("INSERT INTO metrics(total_ram, free_ram, used_ram, container_count, process_count, deleted_count) values(?,?,?,?,?,?)")
-	stmt.Exec(info.TotalRam, info.FreeRam, info.UsedRam, len(contProcs), len(info.Processes), deletedCount)
+	timestamp := time.Now().Unix() * 1000
 
-	stmt2, _ := db.Prepare("INSERT INTO container_stats(pid, name, ram_usage, cpu_usage) values(?,?,?,?)")
-	for _, p := range contProcs {
-		stmt2.Exec(p.Pid, p.Name, p.Rss/1024, p.Cpu)
+	stmt, err := db.Prepare("INSERT INTO metrics(timestamp, total_ram, free_ram, used_ram, container_count, process_count, deleted_count) values(?,?,?,?,?,?,?)")
+	if err != nil {
+		log.Printf("Error metrics: %v", err)
+		return
+	}
+	_, err = stmt.Exec(timestamp, info.TotalRam, info.FreeRam, info.UsedRam, realContainerCount, len(info.Processes), deletedCount)
+	if err != nil {
+		log.Printf("Error insertando metrics: %v", err)
+	}
+	stmt.Close()
+
+	// Leer continfo desde /proc
+	contData, err := ioutil.ReadFile(CONT_FILE)
+	if err != nil {
+		log.Printf("Error leyendo /proc/continfo: %v", err)
+	} else {
+		var contProcs []Process
+		if err := json.Unmarshal(contData, &contProcs); err != nil {
+			log.Printf("Error parseando continfo: %v", err)
+		} else {
+			stmt2, err := db.Prepare("INSERT INTO container_stats(timestamp, container_id, container_name, pid, process_name, ram_usage, cpu_usage) values(?,?,?,?,?,?,?)")
+			if err != nil {
+				log.Printf("Error container_stats: %v", err)
+			} else {
+				insertedCount := 0
+				
+				for _, proc := range contProcs {
+					foundContainer := false
+					for dockerName, container := range dockerContainers {
+						if strings.Contains(proc.Name, "stress") || 
+						   strings.Contains(proc.Name, "sleep") ||
+						   strings.Contains(proc.Name, "sh") ||
+						   strings.Contains(dockerName, "so1_contenedor") {
+							
+							_, err = stmt2.Exec(
+								timestamp, 
+								container.ID[:12], 
+								container.Name,
+								proc.Pid, 
+								proc.Name, 
+								proc.Rss/1024, 
+								proc.Cpu,
+							)
+							if err == nil {
+								insertedCount++
+							}
+							foundContainer = true
+							break
+						}
+					}
+					
+					if !foundContainer && (strings.Contains(proc.Name, "stress") || strings.Contains(proc.Name, "sleep")) {
+						stmt2.Exec(
+							timestamp,
+							fmt.Sprintf("cont_%d", proc.Pid),
+							"unknown",
+							proc.Pid,
+							proc.Name,
+							proc.Rss/1024,
+							proc.Cpu,
+						)
+						insertedCount++
+					}
+				}
+				stmt2.Close()
+			}
+		}
 	}
 
-	stmt3, _ := db.Prepare("INSERT INTO process_stats(pid, name, ram_usage, cpu_usage) values(?,?,?,?)")
-	for _, p := range info.Processes {
-		stmt3.Exec(p.Pid, p.Name, p.Rss/1024, p.Cpu)
+	stmt3, err := db.Prepare("INSERT INTO process_stats(timestamp, pid, name, ram_usage, cpu_usage) values(?,?,?,?,?)")
+	if err != nil {
+		log.Printf("Error  process_stats: %v", err)
+	} else {
+		for _, p := range info.Processes {
+			stmt3.Exec(timestamp, p.Pid, p.Name, p.Rss/1024, p.Cpu)
+		}
+		stmt3.Close()
 	}
-
-	log.Printf("Datos guardados. Procesos Sistema: %d | Contenedores detectados por Kernel: %d", len(info.Processes), len(contProcs))
 }
 
+// Función para gestionar contenedores Docker
 func manageContainers() int {
-	// Obtenemos contenedores ordenados por creación (el más reciente primero)
-	// docker ps por defecto ordena 'created desc'
 	cmd := exec.Command("docker", "ps", "--format", "{{.ID}}|{{.Image}}|{{.Names}}")
 	output, err := cmd.Output()
 	if err != nil {
@@ -198,10 +345,11 @@ func manageContainers() int {
 
 	lines := strings.Split(string(output), "\n")
 
-	var lowContainers []string
-	var highContainers []string
+	var allContainers []ContainerInfo
 
-	log.Println("Analizando contenedores activos...")
+	contData, _ := ioutil.ReadFile(CONT_FILE)
+	var contProcs []Process
+	json.Unmarshal(contData, &contProcs)
 
 	for _, line := range lines {
 		if line == "" {
@@ -216,101 +364,156 @@ func manageContainers() int {
 		image := parts[1]
 		name := parts[2]
 
-		// Ignorar Grafana
 		if strings.Contains(name, "grafana") || strings.Contains(image, "grafana") {
 			continue
 		}
 
-		// Clasificar (Los primeros que entran a la lista son los más nuevos)
-		if strings.Contains(image, "alpine") {
-			lowContainers = append(lowContainers, id)
-		} else if strings.Contains(image, "stress") {
-			highContainers = append(highContainers, id)
+		var ramUsage, cpuUsage int64
+		for _, proc := range contProcs {
+			if strings.Contains(proc.Name, "stress") || 
+			   strings.Contains(proc.Name, "sleep") ||
+			   strings.Contains(proc.Name, "sh") {
+				ramUsage = proc.Rss
+				cpuUsage = proc.Cpu
+				break
+			}
+		}
+
+		container := ContainerInfo{
+			ID:       id,
+			Image:    image,
+			Name:     name,
+			RamUsage: ramUsage,
+			CpuUsage: cpuUsage,
+			IsLow:    strings.Contains(image, "alpine"),
+		}
+
+		allContainers = append(allContainers, container)
+	}
+
+	var lowContainers, highContainers []ContainerInfo
+	for _, c := range allContainers {
+		if c.IsLow {
+			lowContainers = append(lowContainers, c)
+		} else {
+			highContainers = append(highContainers, c)
 		}
 	}
+
+	totalCurrent := len(allContainers)
+
+	if totalCurrent > MAX_CONTAINERS {
+		return emergencyCleanup(lowContainers, highContainers)
+	}
+
+	sort.Slice(lowContainers, func(i, j int) bool {
+		return lowContainers[i].RamUsage > lowContainers[j].RamUsage
+	})
+	sort.Slice(highContainers, func(i, j int) bool {
+		return highContainers[i].RamUsage > highContainers[j].RamUsage
+	})
 
 	totalDeleted := 0
 
-	// Lógica Estricta: Mantener solo los 3 más nuevos de Low
 	if len(lowContainers) > 3 {
-		log.Printf("Exceso Low detectado (%d). Eliminando %d antiguos...", len(lowContainers), len(lowContainers)-3)
+
 		for i := 3; i < len(lowContainers); i++ {
-			exec.Command("docker", "stop", lowContainers[i]).Run()
-			exec.Command("docker", "rm", lowContainers[i]).Run()
+			log.Printf("   └─ [%s] RAM=%d MB CPU=%d%%", 
+				lowContainers[i].Name[:min(12, len(lowContainers[i].Name))], 
+				lowContainers[i].RamUsage/(1024), 
+				lowContainers[i].CpuUsage)
+
+			exec.Command("docker", "stop", lowContainers[i].ID).Run()
+			exec.Command("docker", "rm", lowContainers[i].ID).Run()
 			totalDeleted++
 		}
 	}
 
-	// Lógica Estricta: Mantener solo los 2 más nuevos de High
 	if len(highContainers) > 2 {
-		log.Printf("Exceso High detectado (%d). Eliminando %d antiguos...", len(highContainers), len(highContainers)-2)
 		for i := 2; i < len(highContainers); i++ {
-			exec.Command("docker", "stop", highContainers[i]).Run()
-			exec.Command("docker", "rm", highContainers[i]).Run()
+			log.Printf("   └─ [%s] RAM=%d MB CPU=%d%%", 
+				highContainers[i].Name[:min(12, len(highContainers[i].Name))], 
+				highContainers[i].RamUsage/(1024), 
+				highContainers[i].CpuUsage)
+
+			exec.Command("docker", "stop", highContainers[i].ID).Run()
+			exec.Command("docker", "rm", highContainers[i].ID).Run()
 			totalDeleted++
 		}
 	}
-
-	log.Printf("Resumen Gestión: %d Low conservados | %d High conservados | %d Eliminados",
-		min(len(lowContainers), 3), min(len(highContainers), 2), totalDeleted)
-
 	return totalDeleted
 }
 
-func killExcess(containers []string, limit int, label string) int {
-	deleted := 0
-	if len(containers) > limit {
-		diff := len(containers) - limit
-		toKill := containers[:diff]
+// Función de limpieza de emergencia
+func emergencyCleanup(lowContainers, highContainers []ContainerInfo) int {
+	sort.Slice(lowContainers, func(i, j int) bool {
+		return lowContainers[i].RamUsage > lowContainers[j].RamUsage
+	})
+	sort.Slice(highContainers, func(i, j int) bool {
+		return highContainers[i].RamUsage > highContainers[j].RamUsage
+	})
 
-		for _, id := range toKill {
-			exec.Command("docker", "stop", id).Run()
-			exec.Command("docker", "rm", id).Run()
-			deleted++
-		}
+	totalDeleted := 0
+
+	for i := 3; i < len(lowContainers); i++ {
+		exec.Command("docker", "stop", lowContainers[i].ID).Run()
+		exec.Command("docker", "rm", lowContainers[i].ID).Run()
+		totalDeleted++
 	}
-	return deleted
+
+	for i := 2; i < len(highContainers); i++ {
+		exec.Command("docker", "stop", highContainers[i].ID).Run()
+		exec.Command("docker", "rm", highContainers[i].ID).Run()
+		totalDeleted++
+	}
+	return totalDeleted
 }
 
+// Funciones para gestionar cronjob
 func setupCronjob() {
 	scriptPath, err := filepath.Abs(SCRIPT_PATH)
 	if err != nil {
-		log.Printf("Error ruta script: %v", err)
 		return
 	}
 
+	// Asegurarse de que el script es ejecutable
 	exec.Command("chmod", "+x", scriptPath).Run()
 
-	// Verificar si existe
 	checkCmd := exec.Command("bash", "-c", "crontab -l 2>/dev/null | grep -F '"+scriptPath+"'")
 	output, _ := checkCmd.Output()
 
 	if len(output) > 0 {
-		log.Println("Cronjob ya configurado.")
 		return
 	}
 
-	// Crear
 	logPath := filepath.Join(filepath.Dir(scriptPath), "execution.log")
 	cronEntry := fmt.Sprintf("* * * * * %s >> %s 2>&1", scriptPath, logPath)
+
 	cmd := exec.Command("bash", "-c", fmt.Sprintf("(crontab -l 2>/dev/null; echo '%s') | crontab -", cronEntry))
 	if err := cmd.Run(); err != nil {
-		log.Printf("Error al crear cronjob: %v", err)
+		log.Printf("Error configurando cronjob: %v", err)
 	} else {
-		log.Println("✅ Cronjob activado exitosamente.")
+		log.Println("Cronjob configurado exitosamente")
 	}
 }
 
+// Función para eliminar cronjob
 func removeCronjob() {
 	scriptPath, err := filepath.Abs(SCRIPT_PATH)
 	if err != nil {
+		log.Printf("Error obteniendo ruta: %v", err)
 		return
 	}
+
 	cmd := exec.Command("bash", "-c", fmt.Sprintf("crontab -l 2>/dev/null | grep -v -F '%s' | crontab -", scriptPath))
-	cmd.Run()
-	log.Println("Cronjob eliminado.")
+	if err := cmd.Run(); err != nil {
+		log.Printf("Error al eliminar cronjob: %v", err)
+	} else {
+		log.Println("Cronjob eliminado del sistema")
+	}
 }
 
+// Función auxiliar para obtener el mínimo de dos enteros
 func min(a, b int) int {
 	if a < b {
 		return a

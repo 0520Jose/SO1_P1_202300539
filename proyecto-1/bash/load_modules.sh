@@ -1,81 +1,74 @@
 #!/bin/bash
 
-echo "========================================="
-echo "Cargando Módulos del Kernel - SO1"
-echo "========================================="
+echo "Cargando modulos del Kernel - SO1"
 
-# Obtener directorio del script
+# Directorio del script y del modulo kernel
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 KERNEL_DIR="$SCRIPT_DIR/../modulo-kernel"
 
 cd "$KERNEL_DIR" || exit 1
 
-# Descargar módulos anteriores si existen
-echo "🧹 Limpiando módulos anteriores..."
+# Borrar modulos anteriores si estan cargados
+echo "Limpiando modulos anteriores"
 sudo rmmod continfo 2>/dev/null
 sudo rmmod sysinfo 2>/dev/null
 
 # Limpiar compilación anterior
-echo "🔨 Limpiando compilación anterior..."
+echo "Limpiando compilación anterior"
 make clean > /dev/null 2>&1
 
-# Compilar módulos
-echo "🔧 Compilando módulos..."
+# Compilar modulos
+echo "Compilando modulos"
 if make; then
-    echo "✅ Compilación exitosa"
+    echo "Compilacion existosa"
 else
-    echo "❌ Error en compilación"
+    echo "Error en compilación"
     exit 1
 fi
 
 # Verificar que los archivos .ko existen
 if [ ! -f "sysinfo.ko" ] || [ ! -f "continfo.ko" ]; then
-    echo "❌ Error: Archivos .ko no encontrados"
+    echo "Error: Archivos .ko no encontrados"
     exit 1
 fi
 
-# Cargar módulo sysinfo
-echo "📥 Cargando módulo sysinfo..."
+# Cargar modulo sysinfo
+echo "Cargando modulo sysinfo"
 if sudo insmod sysinfo.ko; then
-    echo "✅ Módulo sysinfo cargado"
+    echo "Modulo sysinfo cargado"
 else
-    echo "❌ Error cargando sysinfo"
+    echo "Error cargando sysinfo"
     exit 1
 fi
 
-# Cargar módulo continfo
-echo "📥 Cargando módulo continfo..."
+# Cargar modulo continfo
+echo "Cargando modulo continfo"
 if sudo insmod continfo.ko; then
-    echo "✅ Módulo continfo cargado"
+    echo "Modulo continfo cargado"
 else
-    echo "❌ Error cargando continfo"
-    sudo rmmod sysinfo  # Limpiar el primero si el segundo falla
+    echo "Error cargando continfo"
+    sudo rmmod sysinfo
     exit 1
 fi
 
-# Verificar que están cargados
-echo ""
-echo "🔍 Verificando módulos cargados:"
+# Verificar que estan cargados
+echo "Verificando modulos cargados:"
 if lsmod | grep -q "sysinfo" && lsmod | grep -q "continfo"; then
-    echo "✅ Ambos módulos están activos"
+    echo "Ambos modulos estan activos"
     lsmod | grep "info"
 else
-    echo "❌ Error: Los módulos no están activos"
+    echo "Error: Los modulos no estan activos"
     exit 1
 fi
 
 # Verificar archivos en /proc
-echo ""
-echo "🔍 Verificando archivos en /proc:"
+echo "Verificando archivos en /proc:"
 if [ -e "/proc/sysinfo_so1_202300539" ] && [ -e "/proc/continfo_so1_202300539" ]; then
-    echo "✅ Archivos /proc creados correctamente"
+    echo "Archivos /proc creados correctamente"
     ls -lh /proc/sysinfo_so1_202300539 /proc/continfo_so1_202300539
 else
-    echo "❌ Error: Archivos /proc no encontrados"
+    echo "Error: Archivos /proc no encontrados"
     exit 1
 fi
 
-echo ""
-echo "========================================="
-echo "✅ Módulos cargados exitosamente"
-echo "========================================="
+echo "Modulos cargados exitosamente"

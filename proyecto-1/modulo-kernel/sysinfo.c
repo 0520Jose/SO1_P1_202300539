@@ -68,6 +68,7 @@ static int show_sysinfo(struct seq_file *m, void *v) {
         seq_printf(m, "    {\n");
         seq_printf(m, "      \"pid\": %d,\n", task->pid);
         seq_printf(m, "      \"name\": \"%s\",\n", task->comm);
+        seq_printf(m, "      \"cmdline\": \"%s\",\n", task->comm);
         seq_printf(m, "      \"state\": %ld,\n", task->__state);
         seq_printf(m, "      \"rss\": %lu,\n", rss / 1024);
         seq_printf(m, "      \"mem_percent\": %llu,\n", mem_usage_percent);

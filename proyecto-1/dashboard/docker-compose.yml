@@ -1,17 +1,24 @@
 version: '3'
+# Definicion de servicios
 services:
+  # Servicio de Grafana
   grafana:
+    # Ultima version de grafana
     image: grafana/grafana:latest
     container_name: grafana_so1
     ports:
       - "3000:3000"
+    # Variables de entorno para la configuracion de Grafana
     environment:
       - GF_INSTALL_PLUGINS=frser-sqlite-datasource
       - GF_SECURITY_ADMIN_PASSWORD=admin
+    # Montajes de volumen para persistencia de datos
     volumes:
       - grafana_storage:/var/lib/grafana
       - ../go-daemon/metrics.db:/var/lib/grafana/metrics.db:ro
     user: "0:0"
 
+# Definicion de volumenes
 volumes:
+  # Almacenamiento de Grafana
   grafana_storage:
