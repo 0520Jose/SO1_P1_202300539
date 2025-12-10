@@ -9,6 +9,9 @@ services:
       - GF_INSTALL_PLUGINS=frser-sqlite-datasource
       - GF_SECURITY_ADMIN_PASSWORD=admin
     volumes:
-      # Asegúrate de que ../go-daemon/metrics.db sea un archivo y NO un directorio
+      - grafana_storage:/var/lib/grafana
       - ../go-daemon/metrics.db:/var/lib/grafana/metrics.db:ro
-    user: "0:0"   # Puedes quitar esto si los permisos del archivo están correctamente configurados
+    user: "0:0"
+
+volumes:
+  grafana_storage:
