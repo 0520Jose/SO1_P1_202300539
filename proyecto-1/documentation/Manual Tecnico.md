@@ -67,16 +67,16 @@ graph LR
 
         subgraph "Gestión y Procesamiento"
             DockerDeamon[Docker Daemon]
-            GoDaemon[Go Daemon\n(Orquestador)]
+            GoDaemon["Go Daemon\n(Orquestador)"]
         end
 
         subgraph "Almacenamiento y Visualización"
-            SQLite[(Metrics.db\nSQLite)]
-            Grafana[Grafana\nDashboard]
+            SQLite[("Metrics.db\nSQLite")]
+            Grafana["Grafana\nDashboard"]
         end
         
         Bash -->|Crea contenedores| DockerDeamon
-        GoDaemon -->|Consulta estado\ny elimina contenedores| DockerDeamon
+        GoDaemon -->|"Consulta estado\ny elimina contenedores"| DockerDeamon
         DockerDeamon -->|Lista contenedores| GoDaemon
         GoDaemon -->|Guarda métricas| SQLite
         Grafana -->|Lee datos| SQLite
@@ -88,7 +88,7 @@ graph LR
 
     subgraph "Kernel Space (Espacio de Kernel)"
         direction TB
-        RawData[Estructuras Internas\n(task_struct, mm_struct)]
+        RawData["Estructuras Internas\n(task_struct, mm_struct)"]
         SysMod[Modulo: sysinfo.ko]
         ContMod[Modulo: continfo.ko]
 
@@ -102,7 +102,7 @@ graph LR
     proc_sysinfo -->|Lee JSON cada 20s| GoDaemon
     proc_continfo -->|Lee JSON cada 20s| GoDaemon
 
-    %% Estilos corregidos
+    %% Estilos
     style RawData fill:#f9f,stroke:#333,stroke-width:2px,color:black
     style SysMod fill:#f9f,stroke:#333,stroke-width:2px,color:black
     style ContMod fill:#f9f,stroke:#333,stroke-width:2px,color:black
